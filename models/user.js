@@ -1,210 +1,113 @@
 "use strict";
 
-const db = require("../db");
-const bcrypt = require("bcrypt");
-const { sqlForPartialUpdate } = require("../helpers/sql");
-const {
-  NotFoundError,
-  BadRequestError,
-  UnauthorizedError,
-} = require("../expressError");
+/** Routes for users. */
 
-const { BCRYPT_WORK_FACTOR } = require("../config.js");
+const jsonschema = require("jsonschema");
+const express = require("express");
+const { ensureLoggedIn, ensureAdmin } = require("../middleware/auth");
+const User = require("../models/user");
+const { createToken } = require("../helpers/tokens");
+const userNewSchema = require("../schemas/userNew.json");
+const userUpdateSchema = require("../schemas/userUpdate.json");
+const { BadRequestError, UnauthorizedError } = require("../expressError");
 
-/** Related functions for users. */
+const router = express.Router();
 
-class User {
-  /** authenticate user with username, password.
-   *
-   * Returns { username, first_name, last_name, email, is_admin }
-   *
-   * Throws UnauthorizedError is user not found or wrong password.
-   **/
+/**
+ * POST /users - Adds a new user by an admin.
+ * Authorization required: Admin
+ * This returns the newly created user and an authentication token for them:
+ * { user: { username, firstName, lastName, email, isAdmin }, token }
+ */
+router.post("/", ensureAdmin, async function (req, res, next) {
+    try {
+        const validator = jsonschema.validate(req.body, userNewSchema);
+        if (!validator.valid) {
+            const errs = validator.errors.map(e => e.stack);
+            throw new BadRequestError(errs);
+        }
 
-  static async authenticate(username, password) {
-    // try to find the user first
-    const result = await db.query(
-          `SELECT username,
-                  password,
-                  first_name AS "firstName",
-                  last_name AS "lastName",
-                  email,
-                  is_admin AS "isAdmin"
-           FROM users
-           WHERE username = $1`,
-        [username],
-    );
-
-    const user = result.rows[0];
-
-    if (user) {
-      // compare hashed password to a new hash from password
-      const isValid = await bcrypt.compare(password, user.password);
-      if (isValid === true) {
-        delete user.password;
-        return user;
-      }
+        const user = await User.register(req.body);
+        const token = createToken(user);
+        return res.status(201).json({ user, token });
+    } catch (err) {
+        return next(err);
     }
+});
 
-    throw new UnauthorizedError("Invalid username/password");
-  }
-
-  /** Register user with data.
-   *
-   * Returns { username, firstName, lastName, email, isAdmin }
-   *
-   * Throws BadRequestError on duplicates.
-   **/
-
-  static async register(
-      { username, password, firstName, lastName, email, isAdmin }) {
-    const duplicateCheck = await db.query(
-          `SELECT username
-           FROM users
-           WHERE username = $1`,
-        [username],
-    );
-
-    if (duplicateCheck.rows[0]) {
-      throw new BadRequestError(`Duplicate username: ${username}`);
+/**
+ * GET /users - Returns list of all users.
+ * Authorization required: Admin
+ */
+router.get("/", ensureAdmin, async function (req, res, next) {
+    try {
+        const users = await User.findAll();
+        return res.json({ users });
+    } catch (err) {
+        return next(err);
     }
+});
 
-    const hashedPassword = await bcrypt.hash(password, BCRYPT_WORK_FACTOR);
-
-    const result = await db.query(
-          `INSERT INTO users
-           (username,
-            password,
-            first_name,
-            last_name,
-            email,
-            is_admin)
-           VALUES ($1, $2, $3, $4, $5, $6)
-           RETURNING username, first_name AS "firstName", last_name AS "lastName", email, is_admin AS "isAdmin"`,
-        [
-          username,
-          hashedPassword,
-          firstName,
-          lastName,
-          email,
-          isAdmin,
-        ],
-    );
-
-    const user = result.rows[0];
-
-    return user;
-  }
-
-  /** Find all users.
-   *
-   * Returns [{ username, first_name, last_name, email, is_admin }, ...]
-   **/
-
-  static async findAll() {
-    const result = await db.query(
-          `SELECT username,
-                  first_name AS "firstName",
-                  last_name AS "lastName",
-                  email,
-                  is_admin AS "isAdmin"
-           FROM users
-           ORDER BY username`,
-    );
-
-    return result.rows;
-  }
-
-  /** Given a username, return data about user.
-   *
-   * Returns { username, first_name, last_name, is_admin, jobs }
-   *   where jobs is { id, title, company_handle, company_name, state }
-   *
-   * Throws NotFoundError if user not found.
-   **/
-
-  static async get(username) {
-    const userRes = await db.query(
-          `SELECT username,
-                  first_name AS "firstName",
-                  last_name AS "lastName",
-                  email,
-                  is_admin AS "isAdmin"
-           FROM users
-           WHERE username = $1`,
-        [username],
-    );
-
-    const user = userRes.rows[0];
-
-    if (!user) throw new NotFoundError(`No user: ${username}`);
-
-    return user;
-  }
-
-  /** Update user data with `data`.
-   *
-   * This is a "partial update" --- it's fine if data doesn't contain
-   * all the fields; this only changes provided ones.
-   *
-   * Data can include:
-   *   { firstName, lastName, password, email, isAdmin }
-   *
-   * Returns { username, firstName, lastName, email, isAdmin }
-   *
-   * Throws NotFoundError if not found.
-   *
-   * WARNING: this function can set a new password or make a user an admin.
-   * Callers of this function must be certain they have validated inputs to this
-   * or a serious security risks are opened.
-   */
-
-  static async update(username, data) {
-    if (data.password) {
-      data.password = await bcrypt.hash(data.password, BCRYPT_WORK_FACTOR);
+/**
+ * GET /users/:username - Returns { username, firstName, lastName, isAdmin }
+ * Authorization required: User or Admin
+ */
+router.get("/:username", ensureLoggedIn, async function (req, res, next) {
+    try {
+        const username = req.params.username;
+        const user = await User.get(username);
+        if (!user) {
+            throw new NotFoundError(`User not found: ${username}`);
+        }
+        if (req.user.username !== username && !req.user.isAdmin) {
+            throw new UnauthorizedError();
+        }
+        return res.json({ user });
+    } catch (err) {
+        return next(err);
     }
+});
 
-    const { setCols, values } = sqlForPartialUpdate(
-        data,
-        {
-          firstName: "first_name",
-          lastName: "last_name",
-          isAdmin: "is_admin",
-        });
-    const usernameVarIdx = "$" + (values.length + 1);
+/**
+ * PATCH /users/:username - Updates user details.
+ * Authorization required: User or Admin
+ * Data can include: { firstName, lastName, password, email, isAdmin }
+ */
+router.patch("/:username", ensureLoggedIn, async function (req, res, next) {
+    try {
+        const username = req.params.username;
+        const validator = jsonschema.validate(req.body, userUpdateSchema);
+        if (!validator.valid) {
+            const errs = validator.errors.map(e => e.stack);
+            throw new BadRequestError(errs);
+        }
+        if (req.user.username !== username && !req.user.isAdmin) {
+            throw new UnauthorizedError();
+        }
 
-    const querySql = `UPDATE users 
-                      SET ${setCols} 
-                      WHERE username = ${usernameVarIdx} 
-                      RETURNING username,
-                                first_name AS "firstName",
-                                last_name AS "lastName",
-                                email,
-                                is_admin AS "isAdmin"`;
-    const result = await db.query(querySql, [...values, username]);
-    const user = result.rows[0];
+        const user = await User.update(username, req.body);
+        return res.json({ user });
+    } catch (err) {
+        return next(err);
+    }
+});
 
-    if (!user) throw new NotFoundError(`No user: ${username}`);
+/**
+ * DELETE /users/:username - Deletes a user.
+ * Authorization required: User or Admin
+ */
+router.delete("/:username", ensureLoggedIn, async function (req, res, next) {
+    try {
+        const username = req.params.username;
+        if (req.user.username !== username && !req.user.isAdmin) {
+            throw new UnauthorizedError();
+        }
 
-    delete user.password;
-    return user;
-  }
+        await User.remove(username);
+        return res.json({ deleted: username });
+    } catch (err) {
+        return next(err);
+    }
+});
 
-  /** Delete given user from database; returns undefined. */
-
-  static async remove(username) {
-    let result = await db.query(
-          `DELETE
-           FROM users
-           WHERE username = $1
-           RETURNING username`,
-        [username],
-    );
-    const user = result.rows[0];
-
-    if (!user) throw new NotFoundError(`No user: ${username}`);
-  }
-}
-
-
-module.exports = User;
+module.exports = router;

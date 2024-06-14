@@ -5,8 +5,8 @@
 const jsonschema = require("jsonschema");
 const express = require("express");
 
-const { BadRequestError } = require("../expressError");
-const { ensureLoggedIn } = require("../middleware/auth");
+const { BadRequestError, NotFoundError } = require("../expressError");
+const { ensureLoggedIn, ensureAdmin } = require("../middleware/auth");
 const Company = require("../models/company");
 
 const companyNewSchema = require("../schemas/companyNew.json");
@@ -14,107 +14,100 @@ const companyUpdateSchema = require("../schemas/companyUpdate.json");
 
 const router = new express.Router();
 
-
-/** POST / { company } =>  { company }
+/**
+ * POST /companies - Create a new company.
  *
- * company should be { handle, name, description, numEmployees, logoUrl }
- *
+ * Requires { handle, name, description, numEmployees, logoUrl } in body.
  * Returns { handle, name, description, numEmployees, logoUrl }
- *
- * Authorization required: login
+ * Authorization required: Admin
  */
+router.post("/", ensureAdmin, async function (req, res, next) {
+    try {
+        const validator = jsonschema.validate(req.body, companyNewSchema);
+        if (!validator.valid) {
+            const errors = validator.errors.map(e => e.stack);
+            throw new BadRequestError(errors.join(", "));
+        }
 
-router.post("/", ensureLoggedIn, async function (req, res, next) {
-  try {
-    const validator = jsonschema.validate(req.body, companyNewSchema);
-    if (!validator.valid) {
-      const errs = validator.errors.map(e => e.stack);
-      throw new BadRequestError(errs);
+        const company = await Company.create(req.body);
+        return res.status(201).json({ company });
+    } catch (err) {
+        return next(err);
     }
-
-    const company = await Company.create(req.body);
-    return res.status(201).json({ company });
-  } catch (err) {
-    return next(err);
-  }
 });
 
-/** GET /  =>
- *   { companies: [ { handle, name, description, numEmployees, logoUrl }, ...] }
+/**
+ * GET /companies - Get all companies with optional filtering.
  *
- * Can filter on provided search filters:
- * - minEmployees
- * - maxEmployees
- * - nameLike (will find case-insensitive, partial matches)
- *
- * Authorization required: none
+ * Filters can be provided in query: name, minEmployees, maxEmployees
+ * Returns [{ handle, name, description, numEmployees, logoUrl }, ...]
+ * Authorization required: None
  */
-
 router.get("/", async function (req, res, next) {
-  try {
-    const companies = await Company.findAll();
-    return res.json({ companies });
-  } catch (err) {
-    return next(err);
-  }
-});
-
-/** GET /[handle]  =>  { company }
- *
- *  Company is { handle, name, description, numEmployees, logoUrl, jobs }
- *   where jobs is [{ id, title, salary, equity }, ...]
- *
- * Authorization required: none
- */
-
-router.get("/:handle", async function (req, res, next) {
-  try {
-    const company = await Company.get(req.params.handle);
-    return res.json({ company });
-  } catch (err) {
-    return next(err);
-  }
-});
-
-/** PATCH /[handle] { fld1, fld2, ... } => { company }
- *
- * Patches company data.
- *
- * fields can be: { name, description, numEmployees, logo_url }
- *
- * Returns { handle, name, description, numEmployees, logo_url }
- *
- * Authorization required: login
- */
-
-router.patch("/:handle", ensureLoggedIn, async function (req, res, next) {
-  try {
-    const validator = jsonschema.validate(req.body, companyUpdateSchema);
-    if (!validator.valid) {
-      const errs = validator.errors.map(e => e.stack);
-      throw new BadRequestError(errs);
+    try {
+        const { name, minEmployees, maxEmployees } = req.query;
+        const filters = { name, minEmployees: parseInt(minEmployees), maxEmployees: parseInt(maxEmployees) };
+        const companies = await Company.findAll(filters);
+        return res.json({ companies });
+    } catch (err) {
+        return next(err);
     }
-
-    const company = await Company.update(req.params.handle, req.body);
-    return res.json({ company });
-  } catch (err) {
-    return next(err);
-  }
 });
 
-/** DELETE /[handle]  =>  { deleted: handle }
+/**
+ * GET /companies/:handle - Get details about a specific company by handle.
  *
- * Authorization: login
+ * Returns { handle, name, description, numEmployees, logoUrl, jobs }
+ * where jobs is [{ id, title, salary, equity }, ...]
+ * Authorization required: None
  */
-
-router.delete("/:handle", ensureLoggedIn, async function (req, res, next) {
-  try {
-    await Company.remove(req.params.handle);
-    return res.json({ deleted: req.params.handle });
-  } catch (err) {
-    return next(err);
-  }
+router.get("/:handle", async function (req, res, next) {
+    try {
+        const company = await Company.get(req.params.handle);
+        if (!company) {
+            throw new NotFoundError(`No company found with handle: ${req.params.handle}`);
+        }
+        return res.json({ company });
+    } catch (err) {
+        return next(err);
+    }
 });
 
+/**
+ * PATCH /companies/:handle - Update a company's details.
+ *
+ * Data can include { name, description, numEmployees, logoUrl }
+ * Returns { handle, name, description, numEmployees, logoUrl }
+ * Authorization required: Admin
+ */
+router.patch("/:handle", ensureAdmin, async function (req, res, next) {
+    try {
+        const validator = jsonschema.validate(req.body, companyUpdateSchema);
+        if (!validator.valid) {
+            const errors = validator.errors.map(e => e.stack);
+            throw new BadRequestError(errors.join(", "));
+        }
+
+        const company = await Company.update(req.params.handle, req.body);
+        return res.json({ company });
+    } catch (err) {
+        return next(err);
+    }
+});
+
+/**
+ * DELETE /companies/:handle - Delete a company by handle.
+ *
+ * Returns { deleted: handle }
+ * Authorization required: Admin
+ */
+router.delete("/:handle", ensureAdmin, async function (req, res, next) {
+    try {
+        await Company.remove(req.params.handle);
+        return res.json({ deleted: req.params.handle });
+    } catch (err) {
+        return next(err);
+    }
+});
 
 module.exports = router;
